@@ -1,18 +1,51 @@
 #if .F.
-	* Testcode:
+	* Test code.
+	CLEAR ALL
 	CLEAR
+	SET TEXTMERGE TO
+	SET ASSERTS ON
+	* Interactive testing of this prg.	
+	*_PSCODE = "TESTMODE"
+
+	* Normal build.
 	CD C:\AutomatedBuild\Source\Vfp_Sample
 	DO BuildProject WITH "Vfp_Sample.pjm"
+	
+	* Include "requireAdministrator" with the exe's manifest.
+	*DO BuildProject WITH "Vfp_Sample.pjm", "Admin"
+	
+	* Leave the manifest as it is but give the exe a different name.
+	*DO BuildProject WITH "Vfp_Sample.pjm", "NULL", "MyGreatApp.exe"
+
+	* Pass an additional parameter to BuildProject2.prg.
+	* We use this to build customer specific versions of our exes
+	* with different #DEFINE settings and different icons.
+	*DO BuildProject WITH "Vfp_Sample.pjm", "NULL", "Customer1sApp.exe", "Customer1"
+
 	PROCEDURE BuildProject
 #endif
 *=================================================================
 * BuildProject.prg.
-* Build automation for Vfp8/Vfp9 projects using CruiseControl.NET.
+* Build automation for Vfp9/Vfp8 projects using CruiseControl.NET.
 * Markus Winhard (mw@bingo-ev.de).
+*
+* Only the first parameter is mandatory, all others are optional.
+*
+* As it's not possible to submit an empty parameter from
+* ccnet.config you can submit NULL as a placeholder in the
+* buildArgs tag of the exec task that calls Vfp9.exe. E.g.:
+* <buildArgs>
+*   BuildProject.prg Sample.pjm NULL MyGreatApp.exe
+* <buildArgs/>
+*
+* The tcExtra parameter is for BuildProject2.prg only. This way
+* you can use the same BuildProject2.prg in different projects and
+* do different things depending on the value of tcExtra.
 *=================================================================
+#DEFINE ccBUILDHOOKPRG "BuildProject2.prg"
 #DEFINE CRLF CHR(13)+CHR(10)
 
-LPARAMETERS tcPjmFile, tcExeName
+LPARAMETERS tcPjmFile, tcManifestType, tcExeName, tcExtra
 *--------------------------------------------
 * Setup.
 *--------------------------------------------
@@ -29,7 +62,15 @@ TRY
 	*--------------------------------------------
 	loBuild = CREATEOBJECT( "PjmFile" )
 	loBuild.PjmFile = m.tcPjmFile
-	loBuild.ExeName = EVL( m.tcExeName, "" )
+	loBuild.ManifestType = IIF( VARTYPE( m.tcManifestType ) == "C" ;
+		AND INLIST( UPPER( m.tcManifestType ), "ADMIN", "USER" ), ;
+		m.tcManifestType, "" )
+	loBuild.ExeName = IIF( VARTYPE( m.tcExeName ) == "C" ;
+		AND NOT INLIST( UPPER( m.tcExeName ), "NULL", ".NULL." ), ;
+		m.tcExeName, "" )
+	loBuild.Extra = IIF( VARTYPE( m.tcExtra ) == "C" ;
+		AND NOT INLIST( UPPER( m.tcExtra ), "NULL", ".NULL." ), ;
+		m.tcExtra, "" )
 	m.loBuild.Build( .T. )
 CATCH TO loException
 	*--------------------------------------------
@@ -119,20 +160,25 @@ RETURN
 * A class to build the project and create
 * the EXE.
 *--------------------------------------------
-DEFINE CLASS PjmFile AS SESSION
+DEFINE CLASS PjmFile AS Session
 
 	*--------------------------------------------
 	* Core properties.
 	*--------------------------------------------
 	ErrorLog = ""
+	ErrorLogCompilePrgs = ""
+	ErrorLogBeforeBuild = ""
+	ErrorLogAfterBuild = ""
 	PjxFile = ""
 	PjmFile = ""
 	PjmFileName = ""
 	PjmPath = ""
 	ErrFile = ""
 	ExeName = ""
-	PrgErrLog = ""
 	SearchPath = ""
+	ManifestType = ""
+	Manifest = ""
+	Extra = ""
 	Success = .F.
 	TestMode = .F.
 	CurrentDefault = SYS(5) + SYS(2003)
@@ -154,17 +200,16 @@ DEFINE CLASS PjmFile AS SESSION
 	Encrypt=.F.
 	NoLogo = .F.
 	CommentStyle = 1
-	Comments = "Project created by " + PROPER(PROGRAM())
+	Comments = "Compiled by BuildProject.prg, "+ ;
+		TRANSFORM( TTOC( DATETIME(), 1 ), "@R 9999-99-99 99:99" )
 	CompanyName = ""
 	FileDescription = ""
-	LegalCopyright = "© 1999-" + ;
-		STR( YEAR(DATE()), 4 ) + " FooBar Inc."
-	LegalTrademarks = "® FooBar is a registered" + ;
-		" trademark of FooBar Inc."
-	ProductName = "FooBar"
-	Major = 0
-	Minor = 0
-	Revision = 0
+	LegalCopyright = ""		&& "© 1999-" + STR( YEAR(DATE()), 4 ) + " FooBar Inc."
+	LegalTrademarks = ""	&& "® FooBar is a registered trademark of FooBar Inc."
+	ProductName = ""		&& "FooBar"
+	Major = YEAR(DATE())
+	Minor = MONTH(DATE())
+	Revision = DAY(DATE())
 	AutoIncrement = .F.
 
 	*--------------------------------------------
@@ -218,6 +263,67 @@ DEFINE CLASS PjmFile AS SESSION
 		RETURN m.This.IsFile( m.This.ExeName ) ;
 			AND NOT m.This.IsFile( m.This.ErrFile ) ;
 			AND EMPTY( m.This.ErrorLog )
+	ENDPROC
+
+	*--------------------------------------------
+	* Create a default manifest.
+	*--------------------------------------------
+	PROCEDURE Manifest_Access
+		*--------------------------------------------
+		* If this project's before-build hook already
+		* set a different manifest don't overwrite
+		* it.
+		*--------------------------------------------
+		IF NOT m.This.Manifest == ""
+			RETURN m.This.Manifest
+		ENDIF
+		*--------------------------------------------
+		* Setup.
+		*--------------------------------------------
+		LOCAL llAdmin, lcManifest
+		llAdmin = UPPER(LEFT( m.This.ManifestType, 5 )) == "ADMIN"
+		*--------------------------------------------
+		* This is an exact copy of the manifest that
+		* Vfp9 SP2 builds into a compiled EXE. We are
+		* modifying only the 'trustInfo' element to
+		* control UAC behavior on Vista, Server 2008
+		* and later operating systems.
+		*--------------------------------------------
+		lcManifest = ""
+		TEXT TO lcManifest TEXTMERGE NOSHOW
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+<assemblyIdentity 
+	version="1.0.0.0" 
+	type="win32" 
+	name="Microsoft.VisualFoxPro" 
+	processorArchitecture="x86"
+/>
+<description>Visual FoxPro</description>
+<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+	<security>
+		<requestedPrivileges>
+			<requestedExecutionLevel level="<< IIF( m.llAdmin, [requireAdministrator], [asInvoker] ) >>" /> 
+		</requestedPrivileges>
+	</security>
+</trustInfo>
+<dependency>
+    <dependentAssembly>
+        <assemblyIdentity
+            type="win32"
+            name="Microsoft.Windows.Common-Controls"
+            version="6.0.0.0"
+            language="*"
+            processorArchitecture="x86"
+            publicKeyToken="6595b64144ccf1df"
+        />
+    </dependentAssembly>
+</dependency>
+</assembly>
+		ENDTEXT
+		This.Manifest = m.lcManifest + CRLF
+		*
+		RETURN m.This.Manifest
 	ENDPROC
 
 	*--------------------------------------------
@@ -280,7 +386,8 @@ DEFINE CLASS PjmFile AS SESSION
 		*--------------------------------------------
 		* Setup.
 		*--------------------------------------------
-		LOCAL lcExe, loException, lcRecompile
+		LOCAL lcExe, loException, lcRecompile, llBuildExe, ;
+			lcManifest, loManifestHelper
 		IF EMPTY( m.This.ExeName )
 			This.ExeName = ADDBS( m.This.PjmPath ) + ;
 				FORCEEXT( m.This.PjmFileName, "exe" )
@@ -301,31 +408,122 @@ DEFINE CLASS PjmFile AS SESSION
 		*--------------------------------------------
 		SET TEXTMERGE TO
 		*--------------------------------------------
+		* Run project specific checks before build.
+		*--------------------------------------------
+		llBuildExe = EMPTY( m.This.ErrorLog ) ;
+			AND m.This.BuildHook( .T. )
+		*--------------------------------------------
 		* Only try to build the EXE if everything
 		* was successful.
 		*--------------------------------------------
-		IF EMPTY( m.This.ErrorLog )
+		IF m.llBuildExe
 			lcRecompile = IIF( m.tlRecompile, "RECOMPILE", "" )
 			TRY
 				BUILD EXE (m.lcExe) FROM (m.This.PjxFile) &lcRecompile.
 			CATCH TO loException
 				This.ErrorLog = m.loException.Message
+				llBuildExe = .F.
 			ENDTRY
 		ENDIF
 		*--------------------------------------------
+		* Replace the EXE manifest.
+		*--------------------------------------------
+		IF m.llBuildExe
+			IF NOT m.This.ManifestType == ""
+				lcManifest = m.This.Manifest
+				loManifestHelper = CREATEOBJECT( "ManifestHelper" )
+				m.loManifestHelper.ReplaceManifest( ;
+					m.lcExe, ;
+					.F., ;
+					m.lcManifest )
+			ENDIF
+		ENDIF
+		*--------------------------------------------
+		* Run project specific checks after build.
+		*--------------------------------------------
+		IF m.llBuildExe
+			m.This.BuildHook( .F. )
+		ENDIF
+		*--------------------------------------------
 		* Delete files that are not part of the
-		* project. We do this after building the EXE
-		* to prevent errors when a developer added a
-		* new file to the project but forgot to
-		* update the PJM. Usually VFP will add the
+		* project. We do this only after building the
+		* EXE to prevent errors when a developer
+		* added a new file to the project but forgot
+		* to update the PJM. Usually VFP will add the
 		* missing file.
 		*--------------------------------------------
 		m.This.CleanupDisk( "" )
 		*--------------------------------------------
 		* Cleanup.
 		*--------------------------------------------
+		STORE .NULL. TO loException, loManifestHelper
+		RELEASE loException, loManifestHelper
+	ENDPROC
+	
+	*--------------------------------------------
+	* Run project specific checks before and
+	* after build.
+	*--------------------------------------------
+	PROCEDURE BuildHook
+		LPARAMETERS tlBeforeBuild
+		*--------------------------------------------
+		* Check environment.
+		*--------------------------------------------
+		IF NOT FILE( ccBUILDHOOKPRG )
+			RETURN .T.
+		ENDIF
+		*--------------------------------------------
+		* Setup.
+		*--------------------------------------------
+		LOCAL lcCmd, lcErrorMessage, llSuccess, loException
+		*--------------------------------------------
+		* Call hook.
+		*--------------------------------------------
+		lcCmd = JUSTSTEM( ccBUILDHOOKPRG )
+		TRY
+			llSuccess = &lcCmd.( @lcErrorMessage, m.This, m.tlBeforeBuild )
+		CATCH TO loException
+			llSuccess = .F.
+			lcErrorMessage = m.loException.Message +CRLF+ ;
+				"in Line " + LTRIM(STR( m.loException.LineNo )) + ;
+				" of " + m.loException.Procedure
+			IF NOT EMPTY( m.loException.LineContents )
+				lcErrorMessage = m.lcErrorMessage +CRLF+ ;
+					"Code: " + m.loException.LineContents
+			ENDIF
+		FINALLY
+		ENDTRY
+		*--------------------------------------------
+		* Check return values.
+		*--------------------------------------------
+		IF NOT EMPTY( m.lcErrorMessage )
+			llSuccess = .F.
+		ENDIF
+		IF NOT m.llSuccess ;
+				AND EMPTY( m.lcErrorMessage )
+			lcErrorMessage = "Unknown problem in " + ccBUILDHOOKPRG + ;
+				" (" + IIF( m.tlBeforeBuild, "BeforeBuild", "AfterBuild" ) + ")"
+		ENDIF
+		*--------------------------------------------
+		* Store error message.
+		*--------------------------------------------
+		DO CASE
+			CASE EMPTY( m.lcErrorMessage )
+				*--------------------------------------------
+				* Nothing to do.
+				*--------------------------------------------
+			CASE m.tlBeforeBuild
+				This.ErrorLogBeforeBuild = "ERROR: " + TRANSFORM( m.lcErrorMessage )
+			OTHERWISE
+				This.ErrorLogAfterBuild = "ERROR: " + TRANSFORM( m.lcErrorMessage )
+		ENDCASE
+		*--------------------------------------------
+		* Cleanup.
+		*--------------------------------------------
 		loException = .NULL.
 		RELEASE loException
+		*
+		RETURN m.llSuccess
 	ENDPROC
 	
 	*--------------------------------------------
@@ -541,17 +739,10 @@ DEFINE CLASS PjmFile AS SESSION
 		*--------------------------------------------
 		* Setup.
 		*--------------------------------------------
-		LOCAL lcFile, lcPjx, lcPjt, lcFileName, loFile, lcDummyFile
+		LOCAL lcPjx, lcPjt, lcFileName, loFile, lcDummyFile
 		lcDummyFile = LOWER( ".\dummy" + SYS(2015) + ".txt" )
-		*--------------------------------------------
-		* Preserve the existing project if testing.
-		* Normally during an automated build there is
-		* only the PJM.
-		*--------------------------------------------
-		lcFile = IIF( m.This.IsFile(FORCEEXT( m.This.PjmFile, "pjx" )), "_", "" ) + ;
-			m.This.PjmFileName
-		lcPjx = FORCEEXT( m.lcFile, "pjx" )
-		lcPjt = FORCEEXT( m.lcFile, "pjt" )
+		lcPjx = FORCEEXT( m.This.PjmFileName, "pjx" )
+		lcPjt = FORCEEXT( m.This.PjmFileName, "pjt" )
 		This.PjxFile = ADDBS( m.This.PjmPath ) + m.lcPjx
 		*--------------------------------------------
 		* Delete the project files.
@@ -685,7 +876,7 @@ DEFINE CLASS PjmFile AS SESSION
 		*
 		RETURN m.lcDevInfo
 	ENDPROC
-
+	
 	*--------------------------------------------
 	* Compile PRG files.
 	*--------------------------------------------
@@ -737,7 +928,7 @@ DEFINE CLASS PjmFile AS SESSION
 		* Store the compile errors.
 		*--------------------------------------------
 		IF NOT EMPTY( m.lcErrLog )
-			This.PrgErrLog = m.lcErrLog
+			This.ErrorLogCompilePrgs = m.lcErrLog
 		ENDIF
 		*--------------------------------------------
 		* Cleanup.
@@ -791,6 +982,15 @@ DEFINE CLASS PjmFile AS SESSION
 			ENDCASE
 		ENDFOR
 		*--------------------------------------------
+		* Delete empty sub dirs.
+		*--------------------------------------------
+		IF NOT m.tcBaseDir == "" ;
+				AND ADIR( laDir, m.tcBaseDir + "*.*", "HSD" ) == 2 ;
+				AND laDir[ 1, 1 ] == "." ;
+				AND laDir[ 2, 1 ] == ".."
+			RD (m.tcBaseDir)
+		ENDIF
+		*--------------------------------------------
 		* Cleanup.
 		*--------------------------------------------
 		IF m.tcBaseDir == ""
@@ -841,7 +1041,7 @@ DEFINE CLASS PjmFile AS SESSION
 		DO CASE
 			CASE m.lcName == FORCEEXT( LOWER(JUSTFNAME( m.This.PjmFile )), "pjx" ) + CHR(0)
 				RETURN .T.
-			CASE m.lcName == "_" + FORCEEXT( LOWER(JUSTFNAME( m.This.PjmFile )), "pjx" ) + CHR(0)
+			CASE m.lcName == FORCEEXT( LOWER(JUSTFNAME( m.This.ExeName )), "pjx" ) + CHR(0)
 				RETURN .T.
 		ENDCASE
 		*--------------------------------------------
@@ -868,16 +1068,9 @@ DEFINE CLASS PjmFile AS SESSION
 	*--------------------------------------------
 	PROCEDURE ConsolidateErrorLogs
 		IF NOT EMPTY( m.This.ErrorLog ) ;
-				OR NOT EMPTY( m.This.PrgErrLog )
-			*--------------------------------------------
-			* Add the contents of the ERR file to the
-			* global error log.
-			*--------------------------------------------
-			IF m.This.IsFile( m.This.ErrFile )
-				This.ErrorLog = m.This.ErrorLog +CRLF+ ;
-					"." +CRLF+ ;
-					FILETOSTR( m.This.ErrFile )
-			ENDIF
+				OR NOT EMPTY( m.This.ErrorLogCompilePrgs ) ;
+				OR NOT EMPTY( m.This.ErrorLogBeforeBuild ) ;
+				OR NOT EMPTY( m.This.ErrorLogAfterBuild )
 			*--------------------------------------------
 			* Add the contents of the initial ERR file to
 			* the global error log.
@@ -889,12 +1082,37 @@ DEFINE CLASS PjmFile AS SESSION
 					FILETOSTR( "BuildProject.err" )
 			ENDIF
 			*--------------------------------------------
-			* Add the contents of the PRG error log to
-			* the global error log.
+			* Add the contents of the PRG compile error
+			* log to the global error log.
 			*--------------------------------------------
-			IF NOT EMPTY( m.This.PrgErrLog )
+			IF NOT EMPTY( m.This.ErrorLogCompilePrgs )
 				This.ErrorLog = m.This.ErrorLog +CRLF+ ;
-					m.This.PrgErrLog
+					m.This.ErrorLogCompilePrgs
+			ENDIF
+			*--------------------------------------------
+			* Add the contents of the before build hook
+			* error log to the global error log.
+			*--------------------------------------------
+			IF NOT EMPTY( m.This.ErrorLogBeforeBuild )
+				This.ErrorLog = m.This.ErrorLog +CRLF+ ;
+					m.This.ErrorLogBeforeBuild
+			ENDIF
+			*--------------------------------------------
+			* Add the contents of the ERR file to the
+			* global error log.
+			*--------------------------------------------
+			IF m.This.IsFile( m.This.ErrFile )
+				This.ErrorLog = m.This.ErrorLog +CRLF+ ;
+					"." +CRLF+ ;
+					FILETOSTR( m.This.ErrFile )
+			ENDIF
+			*--------------------------------------------
+			* Add the contents of the after build hook
+			* error log to the global error log.
+			*--------------------------------------------
+			IF NOT EMPTY( m.This.ErrorLogAfterBuild )
+				This.ErrorLog = m.This.ErrorLog +CRLF+ ;
+					m.This.ErrorLogAfterBuild
 			ENDIF
 			*--------------------------------------------
 			* Write everything to the ERR file.
@@ -960,12 +1178,12 @@ DEFINE CLASS PjmFile AS SESSION
 			* StdErr so build servers like
 			* CruiseControl.NET can catch it.
 			*--------------------------------------------
-			IF NOT m.This.WriteToStdOut( m.lcMessage )
+			IF NOT m.This.WriteToStdOut( @lcMessage )
 				IF NOT m.llSuccess
 					*--------------------------------------------
 					* Add this error to the ERR file.
 					*--------------------------------------------
-					lcMessage = CRLF + ;
+					lcMessage = m.lcMessage +CRLF+ ;
 						PROGRAM( PROGRAM( -1 ) - 1 ) + ": Error writing to StdOut."
 					STRTOFILE( m.lcMessage, m.This.ErrFile, .T. )
 				ENDIF
@@ -990,6 +1208,13 @@ DEFINE CLASS PjmFile AS SESSION
 		* Declare Windows API functions.
 		*--------------------------------------------
 		DECLARE INTEGER AllocConsole IN Win32API
+		*!*	DECLARE INTEGER GetConsoleWindow IN Win32API
+		*!*	DECLARE INTEGER WriteConsole IN Win32API ;
+		*!*		INTEGER hConsoleOutput, STRING @lpBuffer, ;
+		*!*		INTEGER nCharsToWrite, INTEGER lpCharsWritten, ;
+		*!*		INTEGER lpReserved
+		*!*	DECLARE INTEGER ShowWindow IN Win32API ;
+		*!*		INTEGER hWindow, INTEGER nCmdShow
 		DECLARE INTEGER GetStdHandle IN Win32API ;
 			INTEGER nStdHandle
 		DECLARE INTEGER WriteFile IN Win32API ;
@@ -1001,6 +1226,7 @@ DEFINE CLASS PjmFile AS SESSION
 		* by default. So we have to create one first.
 		*--------------------------------------------
 		AllocConsole()
+		*!*	ShowWindow( GetConsoleWindow(), 1 )
 		lnHandle = GetStdHandle( STD_OUTPUT_HANDLE )
 		*--------------------------------------------
 		* Output to "stdout".
@@ -1010,9 +1236,16 @@ DEFINE CLASS PjmFile AS SESSION
 		IF NOT m.lnWritten == m.lnLen ;
 				OR m.lnSuccess == 0
 			llSuccess = .F.
+			tcMessage = m.tcMessage +CRLF+ ;
+				"Error in WriteToStdOut()." +CRLF+ ;
+				"  GetStdHandle() returned " + TRANSFORM( m.lnHandle ) + "." +CRLF+ ;
+				"  WriteFile() returned " + TRANSFORM( m.lnSuccess ) + "." +CRLF+ ;
+				"  lnLen = " + TRANSFORM( m.lnLen ) +CRLF+ ;
+				"  lnWritten = " + TRANSFORM( m.lnWritten )
 		ELSE
 			llSuccess = .T.
 		ENDIF
+		*!*	WriteConsole( m.lnHandle, m.tcMessage, 12, 0, 0 )
 		*--------------------------------------------
 		* Cleanup.
 		*--------------------------------------------
@@ -1045,12 +1278,13 @@ DEFINE CLASS PjmFile AS SESSION
 
 ENDDEFINE
 
+
 *--------------------------------------------
 * A helper class to read the lines in the
 * [ProjectFiles] section of the PJM file into
 * properties.
 *--------------------------------------------
-DEFINE CLASS ProjectFile AS SESSION
+DEFINE CLASS ProjectFile AS Session
 
 	*--------------------------------------------
 	* Properties.
@@ -1081,6 +1315,187 @@ DEFINE CLASS ProjectFile AS SESSION
 		This.User1 = GETWORDNUM( m.tcLine, 7, "," )
 		This.User2 = GETWORDNUM( m.tcLine, 8, "," )
 		This.FileDescription = GETWORDNUM( m.tcLine, 9, "," )
+	ENDPROC
+
+ENDDEFINE
+
+
+*--------------------------------------------
+* A helper class to replace the manifest
+* within the EXE.
+*--------------------------------------------
+DEFINE CLASS ManifestHelper AS Session
+	
+	*--------------------------------------------
+	* Replace the manifest within your EXE (or
+	* delete it if tlDontAddManifest = .T.).
+	*--------------------------------------------
+	PROCEDURE ReplaceManifest
+		LPARAMETERS tcExeFile, tlDontAddManifest, tcManifest
+		*--------------------------------------------
+		* Setup.
+		*--------------------------------------------
+		#DEFINE RT_MANIFEST 24
+		#DEFINE FOX_SIG 33536
+		DECLARE INTEGER BeginUpdateResource IN WIN32API STRING, INTEGER
+		DECLARE INTEGER EndUpdateResource IN WIN32API INTEGER, INTEGER
+		DECLARE INTEGER UpdateResource IN WIN32API ;
+			INTEGER, INTEGER, INTEGER, INTEGER, STRING, INTEGER
+		DECLARE INTEGER GetLastError IN WIN32API
+		LOCAL lnExeSections, lnHandle, lnOffset, i, laExeSections[1], ;
+			lcPmt, lnSig, lnSize, lnChunk, lcWinApiError
+		*--------------------------------------------
+		* Read the exe's sections after the header
+		* and the manifest into an array. Sections
+		* are read in reverse order, i.e., starting
+		* witht the last section at the end of the
+		* exe.
+		*--------------------------------------------
+		lnExeSections = 0
+		lnHandle = FOPEN( m.tcExeFile )
+		lnOffset = FSEEK( m.lnHandle, 0, 2 )		&& Go to EOF.
+		FOR i = 1 TO 20
+			*--------------------------------------------
+			* Find the previous section of the exe.
+			*--------------------------------------------
+			FSEEK( m.lnHandle, m.lnOffset - 14, 0 )
+			lcPmt = FREAD( m.lnHandle, 14 )
+			lnSig = BITAND( m.This.UnIntel(LEFT( m.lcPmt, 2 )), 0xFFFF )
+			lnSize = m.This.UnIntel(SUBSTR( m.lcPmt, 11, 4 ))
+			IF NOT m.lnSig == FOX_SIG
+				*--------------------------------------------
+				* We reached the standard exe header at the
+				* beginning of the vfp exe. No more fox app
+				* code sections.
+				*--------------------------------------------
+				lnExeSections = i - 1
+				EXIT
+			ENDIF
+			*--------------------------------------------
+			* Read the found section into an array
+			* element.
+			*(..)As FREAD() can't read chunks bigger than
+			*(..)16777184 we may have to split a section
+			*(..)into several parts with big exe files.
+			*--------------------------------------------
+			i = i - 1
+			DO WHILE m.lnSize > 0
+				i = i + 1
+				DIMENSION laExeSections[ i ]
+				lnChunk = MIN( m.lnSize, 16777184 )
+				FSEEK( m.lnHandle, m.lnOffset - m.lnChunk, 0 )
+				laExeSections[ i ] = FREAD( m.lnHandle, m.lnChunk )
+				lnSize = m.lnSize - m.lnChunk
+				lnOffset = m.lnOffset - m.lnChunk
+			ENDDO
+		ENDFOR
+		FCLOSE( m.lnHandle )
+		*--------------------------------------------
+		* Add the manifest.
+		*--------------------------------------------
+		lnHandle = BeginUpdateResource( m.tcExeFile, 0 )
+		IF m.lnHandle == 0
+			lcWinApiError = m.This.GetLastErrorMsg()
+			ERROR "Error adding manifest. BeginUpdateResource: " + ;
+				m.lcWinApiError
+		ELSE
+			*--------------------------------------------
+			* Delete existing manifest, if any.
+			*--------------------------------------------
+			UpdateResource( m.lnHandle, RT_MANIFEST, 1, 0x409, 0, 0 )
+			*--------------------------------------------
+			* Add your manifest.
+			*--------------------------------------------
+			IF NOT m.tlDontAddManifest
+				UpdateResource( m.lnHandle, RT_MANIFEST, 1, 0x409, ;
+					m.tcManifest + CHR(0), LEN( m.tcManifest ) )
+			ENDIF
+			IF EndUpdateResource( m.lnHandle, 0 ) == 0
+				lcWinApiError = m.This.GetLastErrorMsg()
+				ERROR "Error adding manifest. EndUpdateResource: " + ;
+					m.lcWinApiError
+			ENDIF
+			*--------------------------------------------
+			* As UpdateResource() effectively deletes the
+			* vfp app code from our exe file, too, we
+			* have to add it back.
+			*--------------------------------------------
+			lnHandle = FOPEN( m.tcExeFile, 2 )
+			FSEEK( m.lnHandle, 0, 2 )		&& Go to EOF.
+			FOR i = m.lnExeSections TO 1 STEP -1
+				FWRITE( m.lnHandle, laExeSections[ i ] )
+			ENDFOR
+			FCLOSE( m.lnHandle )
+		ENDIF
+	ENDPROC
+	
+	*--------------------------------------------
+	* Substitute for CTOBIN(x,"RS") in vfp8.
+	*--------------------------------------------
+	FUNCTION UnIntel
+		LPARAMETERS tcValue
+		LOCAL lnResult, i
+		lnResult = 0
+		FOR i = LEN( m.tcValue ) TO 1 STEP - 1
+			lnResult = m.lnResult * 256 + ASC(SUBSTR( m.tcValue, i, 1 ))
+		ENDFOR
+		RETURN m.lnResult
+	ENDFUNC
+
+	*--------------------------------------------
+	* Get last Windows API error.
+	*--------------------------------------------
+	PROCEDURE GetLastErrorMsg
+		*--------------------------------------------
+		* Setup.
+		*--------------------------------------------
+		#DEFINE FORMAT_MESSAGE_ALLOCATE_BUFFER    256 
+		#DEFINE FORMAT_MESSAGE_ARGUMENT_ARRAY    8192 
+		#DEFINE FORMAT_MESSAGE_FROM_STRING       1024 
+		#DEFINE FORMAT_MESSAGE_FROM_SYSTEM       4096 
+		#DEFINE FORMAT_MESSAGE_IGNORE_INSERTS     512 
+		#DEFINE FORMAT_MESSAGE_MAX_WIDTH_MASK     255 
+		DECLARE INTEGER GetLastError IN Win32Api
+		DECLARE INTEGER FormatMessage IN Win32Api ;
+			INTEGER dwFlags, ;
+			INTEGER lpSource, ;
+			INTEGER dwMessageId, ;
+			INTEGER dwLanguageId, ;
+			INTEGER @lpBuffer, ;
+			INTEGER nSize, ;
+			INTEGER Arguments
+		LOCAL lnLastError, lnStringAddress, lnMessageLength, ;
+			lcMessage
+		*--------------------------------------------
+		* Get error number.
+		*--------------------------------------------
+		lnLastError = GetLastError()
+		IF m.lnLastError == 0
+			RETURN ""
+		ENDIF
+		*--------------------------------------------
+		* Get error message.
+		*--------------------------------------------
+		lnStringAddress = 0
+		lnMessageLength = FormatMessage( ;
+			FORMAT_MESSAGE_ALLOCATE_BUFFER + FORMAT_MESSAGE_FROM_SYSTEM + FORMAT_MESSAGE_IGNORE_INSERTS, ;
+			0, ;
+			m.lnLastError, ;
+			0, ;
+			@lnStringAddress, ;
+			0, ;
+			0 )
+		IF m.lnMessageLength < 1 ;
+				OR m.lnStringAddress < 1
+			lcMessage = ""
+		ELSE
+			lcMessage = ALLTRIM( STRTRAN( ;
+				SYS( 2600, m.lnStringAddress, m.lnMessageLength ), ;
+				CRLF )) + ;
+				" (" + LTRIM(STR( m.lnLastError )) + ")"
+		ENDIF
+		*
+		RETURN m.lcMessage
 	ENDPROC
 
 ENDDEFINE
